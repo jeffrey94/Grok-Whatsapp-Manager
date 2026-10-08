@@ -1,0 +1,34 @@
+{
+  "_comment": "LOCAL SAMPLE ONLY (fake ids, never paired; set <quotes-agent-id> to a real agent id before running scripts/sample-quotes-live.mjs). Acme Quotes (sample) group -> Acme Quotation Bot. Replace the fake group jid and staff number before go-live.",
+  "gateway": {
+    "url": "http://127.0.0.1:1340",
+    "tokenFile": "state/gateway.test.json"
+  },
+  "defaultAgent": "<quotes-agent-id>",
+  "dms": [],
+  "groups": [
+    {
+      "jid": "120363000000000099@g.us",
+      "name": "Acme Quotes (sample)",
+      "agent": "<quotes-agent-id>",
+      "mode": "mention",
+      "keywords": ["报价", "quote", "quotation"],
+      "allowSenders": ["+60100000001"]
+    }
+  ],
+  "authDir": "auth-sample-quotes",
+  "statePath": "state/sample-quotes/bridge-state.json",
+  "statusPath": "state/sample-quotes/status.json",
+  "replyTimeoutMs": 600000,
+  "maxMessageAgeSec": 600,
+  "sendDelayMs": 1200,
+  "typingIndicator": true,
+  "limits": {
+    "outboundPerChatPerMinute": 6,
+    "outboundGlobalPerMinute": 20,
+    "inboundPerSenderPerMinute": 8,
+    "inboundPerChatPerMinute": 20,
+    "replyWindowMs": 900000
+  },
+  "logLevel": "info"
+}

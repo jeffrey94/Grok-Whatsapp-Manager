@@ -1,0 +1,36 @@
+{
+  "_comment": "Sample: one WhatsApp group for quotations (Acme Signage 报价) -> the Acme Quotation Bot agent. Copy to config.json (or config.<name>.json, gitignored), chmod 600, replace every <...> value. Group ids come from state/groups.json after pairing.",
+  "gateway": {
+    "url": "http://127.0.0.1:1340",
+    "tokenFile": "<path-to-mode-600-gateway.json>"
+  },
+  "defaultAgent": "<default-agent-id>",
+  "dms": [
+    { "id": "+<owner-phone-digits>", "name": "Owner" }
+  ],
+  "groups": [
+    {
+      "jid": "<acme-quotes-group-id>@g.us",
+      "name": "Acme Quotes",
+      "agent": "<acme-quotation-bot-agent-id>",
+      "mode": "mention",
+      "keywords": ["报价", "quote", "quotation"],
+      "allowSenders": ["+<staff-1-phone-digits>", "<staff-1-lid-digits>@lid"]
+    }
+  ],
+  "authDir": "auth",
+  "statePath": "state/bridge-state.json",
+  "statusPath": "state/status.json",
+  "replyTimeoutMs": 600000,
+  "maxMessageAgeSec": 600,
+  "sendDelayMs": 1200,
+  "typingIndicator": true,
+  "limits": {
+    "outboundPerChatPerMinute": 6,
+    "outboundGlobalPerMinute": 20,
+    "inboundPerSenderPerMinute": 8,
+    "inboundPerChatPerMinute": 20,
+    "replyWindowMs": 900000
+  },
+  "logLevel": "info"
+}
