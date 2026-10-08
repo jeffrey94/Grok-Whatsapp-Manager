@@ -1,0 +1,36 @@
+# Secrets and WhatsApp session (NEVER commit)
+auth/
+auth-*/
+config.json
+# Local config variants (config.<name>.json); only the examples and config.sample-quotes.json are tracked
+config.*.json
+!config.example.json
+!config.example.*.json
+!config.sample-quotes.json
+.env
+.env.*
+!.env.example
+
+# Runtime state, status, pairing artefacts, logs
+state/
+*.state.json
+bridge-state.json*
+*.corrupt-*
+bridge.pid
+.control-lock/
+*.log
+*.tmp
+*.png
+
+# Accidental copies of Grok gateway discovery records
+gateway.json
+**/gateway.json
+
+# Tooling
+node_modules/
+coverage/
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

@@ -1,0 +1,24 @@
+{
+  "name": "grokbot-whatsapp-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Unofficial self-hosted WhatsApp (Baileys) bridge for Grok Bot's local gateway. WhatsApp twin of grokbot-telegram-bridge.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jeffrey94/Grok-Whatsapp-Manager"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "scripts": {
+    "start": "node src/main.js --config ./config.json",
+    "pair": "node src/pair.js --config ./config.json",
+    "test": "node --test test/",
+    "check": "for f in src/*.js src/core/*.js src/whatsapp/*.js test/*.js test/helpers/*.js scripts/*.mjs; do node --check \"$f\" || exit 1; done && sh -n deploy/whatsapp-bridge-control.sh && echo check-ok"
+  },
+  "dependencies": {
+    "baileys": "7.0.0-rc14"
+  }
+}
