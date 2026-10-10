@@ -71,3 +71,17 @@ test("outbound limits per chat and global", () => {
   c.advance(60_001);
   assert.equal(guard.takeOutbound("a").ok, true);
 });
+
+test("refundOutbound gives back a slot after a failed send; outboundWaitMs reports when the next slot frees", () => {
+  let now = 1_000_000;
+  const guard = new LoopGuard({ outboundPerChatPerMinute: 2 }, { now: () => now });
+  guard.openReplyWindow("a");
+  assert.ok(guard.takeOutbound("a").ok);
+  assert.ok(guard.takeOutbound("a").ok);
+  assert.equal(guard.takeOutbound("a").reason, "outbound-chat-rate");
+  assert.ok(guard.outboundWaitMs("a") > 59_000);
+  guard.refundOutbound("a");
+  assert.ok(guard.takeOutbound("a").ok, "refunded slot is usable");
+  now += 61_000;
+  assert.equal(guard.outboundWaitMs("a"), 0);
+});

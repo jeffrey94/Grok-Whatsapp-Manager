@@ -10,8 +10,28 @@ import { chmod } from "node:fs/promises";
 import path from "node:path";
 import { createBaileysLogger } from "../logger.js";
 import { bareJid } from "../core/routing.js";
+import { resolveMentions } from "./mentions.js";
 import { normalizeMessage } from "./normalize.js";
 import { ensurePrivateDir, readSessionInfo, writePrivateJson } from "./secure-fs.js";
+
+function withTimeout(promise, ms) {
+  return Promise.race([
+    Promise.resolve(promise),
+    new Promise((resolve) => setTimeout(() => resolve(undefined), ms).unref?.()),
+  ]);
+}
+
+/** Like withTimeout, but rejects: a WhatsApp call that never settles must not wedge a queue. */
+export function rejectAfter(promise, ms, label) {
+  let timer;
+  return Promise.race([
+    Promise.resolve(promise),
+    new Promise((_, reject) => {
+      // Ref'd on purpose: the timeout must fire even if nothing else is pending (cleared on settle).
+      timer = setTimeout(() => reject(Object.assign(new Error(`${label} timed out after ${ms}ms`), { code: "WA_TIMEOUT" })), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
 
 export class NeedsPairingError extends Error {
   constructor(message = "No paired WhatsApp session. Run the pair command first.") {
@@ -67,8 +87,25 @@ export class BaileysTransport {
     heartbeatMs = 60_000,
     baileysLogLevel = "warn",
     groupsListPath,
+    // Liveness: Baileys pings every ~30s, so a connected socket sees a frame at least that often.
+    // No frame for staleSocketMs while "connected" = silently dead socket: force a reconnect.
+    staleSocketMs = 150_000,
+    sendTimeoutMs = 90_000,
+    typingTimeoutMs = 3_000,
+    healthProbe,
+    now = () => Date.now(),
+    // Box pause detection: wall clock jumping ahead of the monotonic clock means the
+    // whole machine was frozen (not our event loop). Check often, cheaply.
+    pauseCheckMs = 5_000,
+    pauseThresholdMs = 10_000,
+    monotonic = () => performance.now(),
   }) {
-    Object.assign(this, { authDir, groups, log, status, onEvent, onOpen, makeSocket, authStateFactory, downloader, backoff, heartbeatMs, groupsListPath });
+    this.pauseCheckMs = pauseCheckMs;
+    this.pauseThresholdMs = pauseThresholdMs;
+    this.monotonic = monotonic;
+    Object.assign(this, { authDir, groups, log, status, onEvent, onOpen, makeSocket, authStateFactory, downloader, backoff, heartbeatMs, groupsListPath, staleSocketMs, sendTimeoutMs, typingTimeoutMs, healthProbe, now });
+    this.lastFrameAt = undefined;
+    this.lastUpsertAt = undefined;
     this.baileysLogger = createBaileysLogger(log, baileysLogLevel);
     this.sock = undefined;
     this.connected = false;
@@ -96,11 +133,77 @@ export class BaileysTransport {
     await this.status.update({ state: "connecting", account: session.account, alert: false, detail: undefined });
     // The heartbeat stays ref'd on purpose: it keeps the process alive while the
     // socket is closed between reconnect attempts (see scheduleReconnect).
-    this.heartbeat = setInterval(() => {
-      this.status.heartbeat()?.catch?.((error) => this.log.warn(`Status heartbeat failed: ${error.message}`));
-    }, this.heartbeatMs);
+    this.heartbeat = setInterval(() => this.heartbeatTick(), this.heartbeatMs);
+    this.lastClock = { wall: this.now(), mono: this.monotonic() };
+    if (this.pauseCheckMs > 0) {
+      this.pauseTimer = setInterval(() => this.checkPause(), this.pauseCheckMs);
+      this.pauseTimer.unref?.();
+    }
     this.connect();
     return this.stopped;
+  }
+
+  /**
+   * Every heartbeatMs: write liveness fields to status.json (read by the control
+   * script's ensure) and kill a socket that is "connected" but receives nothing.
+   */
+  heartbeatTick({ skipWatchdog = false } = {}) {
+    const now = this.now();
+    let probe = {};
+    try {
+      probe = this.healthProbe?.() ?? {};
+    } catch {}
+    const iso = (ms) => (Number.isFinite(ms) ? new Date(ms).toISOString() : undefined);
+    this.status.heartbeat({
+      heartbeatAt: iso(now),
+      lastFrameAt: iso(this.lastFrameAt),
+      lastUpsertAt: iso(this.lastUpsertAt),
+      pausesDetected: this.pausesDetected ?? 0,
+      lastPauseAt: iso(this.lastPauseAt),
+      lastPauseMs: this.lastPauseMs,
+      ...probe,
+    })?.catch?.((error) => this.log.warn(`Status heartbeat failed: ${error.message}`));
+    if (!skipWatchdog && this.connected && !this.stopping && this.staleSocketMs > 0 && Number.isFinite(this.lastFrameAt)
+      && now - this.lastFrameAt > this.staleSocketMs) {
+      this.log.warn(`WhatsApp socket silent for ${Math.round((now - this.lastFrameAt) / 1000)}s while connected; forcing a reconnect`);
+      this.lastFrameAt = now; // one kick per stale period
+      try {
+        this.sock?.end?.(Object.assign(new Error("Stale socket (no frames)"), { output: { statusCode: 408 } }));
+      } catch (error) {
+        this.log.warn(`Ending stale socket failed: ${error.message}`);
+      }
+    }
+  }
+
+  /**
+   * The box can be suspended while idle: every process freezes, the monotonic
+   * clock stops, the wall clock does not. On resume our timers still think little
+   * time passed, WhatsApp has long dropped the socket, and status.json looks stale.
+   * Detect it, say so in the log, refresh the heartbeat now and reconnect at once.
+   */
+  checkPause() {
+    const wall = this.now();
+    const mono = this.monotonic();
+    const previous = this.lastClock ?? { wall, mono };
+    this.lastClock = { wall, mono };
+    const jumpMs = (wall - previous.wall) - (mono - previous.mono);
+    if (!(jumpMs > this.pauseThresholdMs)) return false;
+    this.log.warn(`Box was paused for about ${Math.round(jumpMs / 1000)}s (wall clock jumped, monotonic did not); refreshing heartbeat${this.connected ? " and reconnecting WhatsApp" : ""}`);
+    this.pausesDetected = (this.pausesDetected ?? 0) + 1;
+    this.lastPauseAt = wall;
+    this.lastPauseMs = jumpMs;
+    // The silence was the pause, not a dead socket: restart the frame clock so
+    // status.json (read by ensure) doesn't report a stale frame during reconnect.
+    this.lastFrameAt = wall;
+    this.heartbeatTick({ skipWatchdog: true });
+    if (this.connected && !this.stopping) {
+      try {
+        this.sock?.end?.(Object.assign(new Error("Box resumed from pause"), { output: { statusCode: 408 } }));
+      } catch (error) {
+        this.log.warn(`Ending socket after pause failed: ${error.message}`);
+      }
+    }
+    return true;
   }
 
   /** connect() for timers and event handlers: a throw is logged and retried, never fatal. */
@@ -122,6 +225,9 @@ export class BaileysTransport {
       cachedGroupMetadata: async (jid) => this.groupMeta.get(jid),
     }));
     this.sock = sock;
+    this.lastFrameAt = this.now();
+    // Any frame from WhatsApp (pings included) proves the socket is alive.
+    sock.ws?.on?.("frame", () => { if (sock === this.sock) this.lastFrameAt = this.now(); });
     sock.ev.on("creds.update", () => void this.saveCreds().catch((error) => this.log.error(`Saving WhatsApp creds failed: ${error.message}`)));
     sock.ev.on("connection.update", (update) => void this.onConnectionUpdate(update, sock).catch((error) => this.log.error(`connection.update handler failed: ${error.message}`)));
     sock.ev.on("messages.upsert", (upsert) => this.onUpsert(upsert));
@@ -176,6 +282,8 @@ export class BaileysTransport {
       this.connected = true;
       this.attempts = 0;
       this.log.info(`WhatsApp connected account=${this.maskedAccount()}`);
+      this.lastFrameAt = this.now();
+      this.heartbeatTick({ skipWatchdog: true });
       await this.status.update({ state: "connected", connectedSince: new Date().toISOString(), reconnectAttempts: 0, lastDisconnectCode: undefined });
       await this.checkGroups();
       for (const waiter of this.connectionWaiters ?? []) waiter();
@@ -235,6 +343,10 @@ export class BaileysTransport {
     for (const meta of Object.values(all ?? {})) this.rememberGroup(meta);
     await this.writeGroupsList(all);
     const visible = configured.filter((group) => this.groupMeta.has(group.jid)).map((group) => group.jid);
+    for (const jid of visible) {
+      const meta = this.groupMeta.get(jid);
+      this.log.info(`Group ${jid} addressing=${meta?.addressingMode ?? "unknown"} participants=${meta?.participants?.length ?? "?"}`);
+    }
     const missing = configured.filter((group) => !this.groupMeta.has(group.jid));
     for (const group of missing) {
       this.log.warn(`WARNING configured group NOT visible to this WhatsApp account: ${group.jid}${group.name ? ` (${group.name})` : ""}. Add the bridge number to the group or fix the JID in config.json.`);
@@ -264,6 +376,7 @@ export class BaileysTransport {
         jid: meta.id,
         subject: typeof meta.subject === "string" ? meta.subject : "",
         participants: Array.isArray(meta.participants) ? meta.participants.length : undefined,
+        addressing: meta.addressingMode,
         configured: configured.has(bareJid(meta.id)),
       }))
       .sort((a, b) => a.subject.localeCompare(b.subject));
@@ -275,6 +388,7 @@ export class BaileysTransport {
   }
 
   onUpsert(upsert) {
+    this.lastUpsertAt = this.now();
     // "notify" = new live messages. "append" = history/offline sync: never answered.
     if (upsert?.type !== "notify") return;
     const events = [];
@@ -379,9 +493,41 @@ export class BaileysTransport {
   }
 
   async sendText(chatId, text, { quoted } = {}) {
-    const sent = await (await this.requireSocket()).sendMessage(chatId, { text }, quoted ? { quoted } : undefined);
+    const sock = await this.requireSocket();
+    const content = await this.withMentions(chatId, text, sock);
+    const sent = await rejectAfter(sock.sendMessage(chatId, content, quoted ? { quoted } : undefined), this.sendTimeoutMs, "WhatsApp sendMessage");
     this.rememberSent(sent);
-    return { id: sent?.key?.id };
+    return { id: sent?.key?.id, mentions: content.mentions?.length ?? 0 };
+  }
+
+  /**
+   * Turn "@<digits>" / "@+<digits>" tokens for people IN this chat into real
+   * WhatsApp mentions (see mentions.js). Any failure falls back to plain text.
+   */
+  async withMentions(chatId, text, sock = this.sock) {
+    if (typeof text !== "string" || !/@\+?\d{7,15}/.test(text)) return { text };
+    try {
+      const jid = bareJid(chatId);
+      let meta;
+      if (jid?.endsWith("@g.us")) {
+        meta = this.groupMeta.get(jid);
+        if (!meta?.participants?.length && typeof sock?.groupMetadata === "function") {
+          meta = await withTimeout(sock.groupMetadata(jid), 5_000);
+          if (meta) this.rememberGroup(meta);
+        }
+      }
+      const configured = this.groups.find((group) => bareJid(group.jid) === jid);
+      const knownIdSets = (configured?.members ?? []).map((member) => member?.ids ?? (member?.id ? [member.id] : []));
+      const mapping = sock?.signalRepository?.lidMapping;
+      const lookupLid = typeof mapping?.getLIDForPN === "function" ? (pn) => withTimeout(mapping.getLIDForPN(pn), 1_500) : undefined;
+      const resolved = await resolveMentions(text, { chatId, meta, knownIdSets, lookupLid });
+      if (!resolved.mentions.length) return { text };
+      this.log.info(`Mentions attached chat=${chatId} count=${resolved.mentions.length} kind=${resolved.mentions.every((id) => id.endsWith("@lid")) ? "lid" : "pn"}`);
+      return { text: resolved.text, mentions: resolved.mentions };
+    } catch (error) {
+      this.log.warn(`Mention resolution failed chat=${chatId}: ${error?.message ?? error}`);
+      return { text };
+    }
   }
 
   async sendFile(chatId, { bytes, filename, mimetype }, { quoted } = {}) {
@@ -389,7 +535,8 @@ export class BaileysTransport {
     const content = /^image\/(?:jpeg|png|webp)$/i.test(mimetype ?? "")
       ? { image: buffer, mimetype }
       : { document: buffer, mimetype: mimetype || "application/octet-stream", fileName: filename };
-    const sent = await (await this.requireSocket()).sendMessage(chatId, content, quoted ? { quoted } : undefined);
+    const sock = await this.requireSocket();
+    const sent = await rejectAfter(sock.sendMessage(chatId, content, quoted ? { quoted } : undefined), this.sendTimeoutMs, "WhatsApp sendMessage");
     this.rememberSent(sent);
     return { id: sent?.key?.id };
   }
@@ -401,7 +548,7 @@ export class BaileysTransport {
 
   async setTyping(chatId, on) {
     if (!this.connected) return;
-    await this.sock.sendPresenceUpdate(on ? "composing" : "paused", chatId);
+    await rejectAfter(this.sock.sendPresenceUpdate(on ? "composing" : "paused", chatId), this.typingTimeoutMs, "WhatsApp presence update");
   }
 
   /** Close the socket WITHOUT logging out (the pairing stays valid). */
@@ -410,6 +557,7 @@ export class BaileysTransport {
     this.stopping = true;
     clearTimeout(this.reconnectTimer);
     clearInterval(this.heartbeat);
+    clearInterval(this.pauseTimer);
     try {
       this.sock?.end?.(undefined);
     } catch {}

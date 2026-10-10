@@ -149,6 +149,8 @@ export function parseConfig(raw, { baseDir = process.cwd(), readToken = true } =
     statePath: resolve(raw.statePath, "state/bridge-state.json"),
     statusPath: resolve(raw.statusPath, "state/status.json"),
     replyTimeoutMs: positiveInt(raw.replyTimeoutMs, "replyTimeoutMs", 10 * 60_000),
+    // Max time one turn holds its agent's queue before the next message is handled (0 = no cap).
+    turnQueueHoldMs: positiveInt(raw.turnQueueHoldMs, "turnQueueHoldMs", 120_000),
     pollIntervalMs: positiveInt(raw.pollIntervalMs, "pollIntervalMs", 1_000),
     stableReplyMs: raw.stableReplyMs === undefined ? undefined : positiveInt(raw.stableReplyMs, "stableReplyMs", undefined),
     // Late agent messages (after the turn) go to the chat the agent last served for this long; 0 = off.
