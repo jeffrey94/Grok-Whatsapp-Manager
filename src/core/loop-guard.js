@@ -29,6 +29,23 @@ export class SlidingWindowLimiter {
     return Math.max(0, this.limit - this.#recent(key).length);
   }
 
+  /** Give back the most recent hit (the send it paid for never happened). */
+  refund(key) {
+    const list = this.#recent(key);
+    if (!list.length) return false;
+    list.pop();
+    if (list.length) this.hits.set(key, list);
+    else this.hits.delete(key);
+    return true;
+  }
+
+  /** Ms until one more hit would fit (0 = now). */
+  waitMs(key) {
+    if (this.wouldAllow(key)) return 0;
+    const list = this.#recent(key);
+    return Math.max(0, list[list.length - this.limit] + this.windowMs - this.now() + 1);
+  }
+
   /** Record a hit if it fits; returns true when recorded. */
   tryTake(key) {
     if (!this.wouldAllow(key)) return false;
@@ -133,6 +150,17 @@ export class LoopGuard {
     this.outboundChat.tryTake(chatId);
     this.outboundGlobal.tryTake("*");
     return { ok: true };
+  }
+
+  /** A send that took a slot failed (socket closed, timeout): it must not count against the rate. */
+  refundOutbound(chatId) {
+    this.outboundChat.refund(chatId);
+    this.outboundGlobal.refund("*");
+  }
+
+  /** Ms until both the per-chat and the global outbound limit allow one more send. */
+  outboundWaitMs(chatId) {
+    return Math.max(this.outboundChat.waitMs(chatId), this.outboundGlobal.waitMs("*"));
   }
 
   /** Outbound sends still available for this chat in the current minute (per-chat and global). */

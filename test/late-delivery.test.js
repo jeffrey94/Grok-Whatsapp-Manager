@@ -289,3 +289,66 @@ test("item 3: recovered turn after a restart does not resend entries delivered b
   await ctx.bridge.recoverPending();
   assert.deepEqual(texts(ctx), ["new part"]);
 });
+
+test("freeze fix: a turn still waiting on the agent releases the agent queue after turnQueueHoldMs, so the next message is handled", async () => {
+  const ctx = await setup({ replyTimeoutMs: 3_000 });
+  ctx.bridge.options.turnQueueHoldMs = 150;
+  ctx.gw.onPrompt = () => { ctx.gw.status = { isRunning: true, isRunningTurn: true, isComposingMessage: false }; };
+  const started = Date.now();
+  const first = ctx.bridge.ingest(mention("long job"));
+  const second = ctx.bridge.ingest(mention("quick question"));
+  await waitFor(() => ctx.gw.prompts.length === 2, 2_000);
+  assert.ok(Date.now() - started < 2_000, "second prompt did not wait for the first turn's reply timeout");
+  assert.ok(ctx.log.lines.some((line) => /releasing the queue/.test(line)), "release was logged");
+  ctx.gw.status = { isRunning: false, isRunningTurn: false, isComposingMessage: false };
+  ctx.gw.reply("done");
+  await Promise.allSettled([first, second]);
+  await ctx.bridge.drain();
+});
+
+test("freeze fix: a hung typing-off presence update never holds the queue", async () => {
+  const ctx = await setup({ replyTimeoutMs: 3_000 });
+  ctx.bridge.options.typingIndicator = true;
+  ctx.transport.setTyping = (_chat, on) => (on ? Promise.resolve() : new Promise(() => {}));
+  ctx.gw.onPrompt = () => { setTimeout(() => ctx.gw.reply("hi"), 5); };
+  await ctx.bridge.ingest(mention("one"));
+  const result = await Promise.race([ctx.bridge.ingest(mention("two")), new Promise((r) => setTimeout(() => r("stuck"), 2_000))]);
+  assert.notEqual(result, "stuck");
+  assert.equal(ctx.gw.prompts.length, 2);
+});
+
+test("freeze fix: in-flight inbound messages are tracked for the watchdog and cleared when done", async () => {
+  const ctx = await setup({ replyTimeoutMs: 3_000 });
+  let release;
+  ctx.gw.onPrompt = () => { ctx.gw.status = { isRunning: true, isRunningTurn: true, isComposingMessage: false }; release = () => { ctx.gw.status = { isRunning: false, isRunningTurn: false, isComposingMessage: false }; ctx.gw.reply("ok"); }; };
+  const task = ctx.bridge.ingest(mention("watch me"));
+  await waitFor(() => ctx.gw.prompts.length === 1);
+  assert.equal(ctx.bridge.inflight.size, 1);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.ok(ctx.bridge.oldestInflightMs() >= 20);
+  release();
+  await task;
+  await waitFor(() => ctx.bridge.inflight.size === 0);
+  assert.equal(ctx.bridge.oldestInflightMs(), 0);
+});
+
+test("10:14 regression: failed sends don't burn the rate budget, and a rate-limited reply waits for a slot instead of being dropped", async () => {
+  const ctx = await setup({ replyTimeoutMs: 3_000 });
+  ctx.bridge.guard = new LoopGuard({ outboundPerChatPerMinute: 2 });
+  ctx.bridge.guard.openReplyWindow(GROUP);
+  // Four sends fail on a closed socket (they must be refunded).
+  let failures = 4;
+  const realSend = ctx.transport.sendText;
+  ctx.transport.sendText = async (...args) => { if (failures > 0) { failures -= 1; throw new Error("Connection Closed"); } return realSend(...args); };
+  for (let i = 0; i < 4; i += 1) {
+    await assert.rejects(ctx.bridge.deliverEntries({ id: AGENT }, undefined, [{ id: `f${i}`, kind: "send-message", message: { type: "text", content: "retry me" } }], { chatId: GROUP }));
+  }
+  assert.equal(ctx.bridge.guard.outboundBudget(GROUP), 2, "failed sends were refunded");
+  // Budget 2, three replies: the third waits for a slot (short window in this test) rather than dropping.
+  ctx.bridge.guard.outboundChat.windowMs = 300;
+  ctx.bridge.options.rateWaitMaxMs = 2_000;
+  const entries = ["a", "b", "c"].map((t, i) => ({ id: `r${i}`, kind: "send-message", message: { type: "text", content: t } }));
+  await ctx.bridge.deliverEntries({ id: AGENT }, undefined, entries, { chatId: GROUP });
+  assert.deepEqual(texts(ctx), ["a", "b", "c"]);
+  assert.ok(!ctx.log.lines.some((line) => /Outbound dropped/.test(line)));
+});

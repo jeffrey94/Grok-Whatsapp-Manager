@@ -165,12 +165,32 @@ list and can never be `BDM`/`admin`.
 | Max inbound turns per sender per minute | `8` |
 | Max inbound turns per chat per minute | `20` |
 | Pause between outbound messages | `sendDelayMs: 1200` |
+| One turn holds its agent's queue for at most this long before the next message is handled (0 = no cap) | `turnQueueHoldMs: 120000` |
+| A rate-limited reply is not dropped: the send budget is refunded and the bridge waits for the window to free up | always |
 | Ignore own messages, Meta AI and other bot JIDs, and echoes of our own recent text | always |
 | Ignore status broadcasts, newsletters, broadcast lists, reactions and protocol messages | always |
 | Ignore messages older than `maxMessageAgeSec` (600 s), for example after downtime | always |
 | No history sync, not shown as "online", the bridge never marks messages read | always |
 | libsignal console dumps (session objects with private keys) are dropped or redacted before they reach `bridge.log` | always |
 | Stray promise rejections and exceptions are logged and the process keeps running; reconnects keep the process alive | always |
+
+## Mentions, health and recovery
+
+- **Real @mentions.** When an agent reply contains `@<digits>` (or `@+<digits>`,
+  7-15 digit phone number) for someone who is in that chat, the bridge sends a
+  real WhatsApp mention (it notifies them). In LID-addressed groups the token is
+  rewritten to the participant's LID. Unknown numbers stay plain text.
+- **Freeze protection.** WhatsApp calls have timeouts (send 90 s, typing
+  3 s), so one stuck call cannot block a chat; `turnQueueHoldMs` (default
+  120000) caps how long a turn holds its agent's queue.
+- **Dead-connection watchdog.** If a "connected" socket sees no frame for
+  150 s, the bridge forces a reconnect. `state/status.json` carries health
+  fields (event-loop lag, oldest in-flight inbound, in-flight count) and
+  `deploy/whatsapp-bridge-control.sh ensure` uses them; restart reasons are
+  logged.
+- **Pause detection.** After the box was paused or suspended (a clock jump of
+  more than 10 s), the bridge reconnects cleanly instead of treating the gap as
+  a dead socket.
 
 ## Requirements
 

@@ -1,4 +1,5 @@
 import path from "node:path";
+import { monitorEventLoopDelay } from "node:perf_hooks";
 import { installConsoleGuard } from "./console-guard.js";
 import { WhatsAppBridge } from "./bridge.js";
 import { parseArgs } from "./cli-args.js";
@@ -63,12 +64,22 @@ const shutdown = new AbortController();
 
 let bridge;
 let recovered = false;
+// Event-loop lag: a synchronous block would freeze inbound, keepalive and heartbeat at once.
+const loopDelay = monitorEventLoopDelay({ resolution: 50 });
+loopDelay.enable();
+const healthProbe = () => {
+  const maxLagMs = Math.round(loopDelay.max / 1e6);
+  loopDelay.reset();
+  if (maxLagMs > 5_000) log.warn(`Event loop was blocked for up to ${maxLagMs}ms in the last heartbeat period`);
+  return { eventLoopMaxLagMs: maxLagMs, oldestInboundMs: bridge?.oldestInflightMs?.() ?? 0, inflightInbound: bridge?.inflight?.size ?? 0 };
+};
 const transport = new BaileysTransport({
   authDir: config.authDir,
   groups: config.groups,
   groupsListPath: path.join(path.dirname(config.statusPath), "groups.json"),
   log,
   status,
+  healthProbe,
   onEvent: (event) => bridge.ingest(event, { signal: shutdown.signal }),
   // Finish turns interrupted by a restart, once, after the first successful connect.
   onOpen: () => {
@@ -100,6 +111,7 @@ bridge = new WhatsAppBridge({
     typingIndicator: config.typingIndicator,
     quoteInDms: config.quoteInDms,
     replyTimeoutMs: config.replyTimeoutMs,
+    ...(config.turnQueueHoldMs !== undefined ? { turnQueueHoldMs: config.turnQueueHoldMs } : {}),
     stableReplyMs: config.stableReplyMs,
     ...(config.lateDeliveryWindowMs !== undefined ? { lateDeliveryWindowMs: config.lateDeliveryWindowMs } : {}),
     voiceHint: config.voiceHint,

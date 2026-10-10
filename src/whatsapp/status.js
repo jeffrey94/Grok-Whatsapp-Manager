@@ -24,8 +24,8 @@ export class StatusFile {
     return this.queue;
   }
 
-  heartbeat() {
-    return this.update({});
+  heartbeat(fields = {}) {
+    return this.update(fields);
   }
 
   static read(filename) {

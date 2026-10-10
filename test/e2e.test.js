@@ -284,6 +284,7 @@ test("approvals are handed to the desktop, never approved from WhatsApp", async 
 
 test("outbound rate limit caps messages per chat per minute", async () => {
   const ctx = await setup({ limits: { outboundPerChatPerMinute: 2 } });
+  ctx.bridge.options.rateWaitMaxMs = 0; // hard cap: no waiting for a slot in this test
   try {
     ctx.sock.deliver([dm("R1", "three replies please")]);
     await waitFor(() => ctx.state.isPromptTurnRetired("agent-default", `whatsapp:${OWNER}:R1`));

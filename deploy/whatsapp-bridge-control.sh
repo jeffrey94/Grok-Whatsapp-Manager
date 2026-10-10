@@ -17,6 +17,12 @@ STATUS_FILE=${WA_BRIDGE_STATUS:-$BRIDGE_HOME/state/status.json}
 AUTH_DIR=${WA_BRIDGE_AUTH:-$BRIDGE_HOME/auth}
 CONNECT_WAIT_SECONDS=${CONNECT_WAIT_SECONDS:-60}
 HEARTBEAT_STALE_SECONDS=${HEARTBEAT_STALE_SECONDS:-300}
+HEARTBEAT_GRACE_SECONDS=${HEARTBEAT_GRACE_SECONDS:-45}
+# Connected but no WhatsApp frame (Baileys pings every ~30s) for this long = dead socket.
+FRAME_STALE_SECONDS=${FRAME_STALE_SECONDS:-300}
+# An accepted inbound message still unfinished after this long = wedged pipeline
+# (normal worst case is turnQueueHoldMs, default 120s, plus queueing).
+INBOUND_STUCK_SECONDS=${INBOUND_STUCK_SECONDS:-900}
 
 acquire_lock() {
   if ! mkdir "$LOCK_DIR" 2>/dev/null; then
@@ -76,6 +82,32 @@ heartbeat_age() {
       process.stdout.write(String(Number.isFinite(t) ? Math.round((Date.now() - t) / 1000) : 999999));
     } catch { process.stdout.write("999999"); }
   ' "$STATUS_FILE"
+}
+
+# Seconds since an ISO timestamp field in status.json (empty when the field is absent).
+field_age() {
+  [ -f "$STATUS_FILE" ] || return 0
+  node -e '
+    const fs = require("fs");
+    try {
+      const s = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const t = Date.parse(s[process.argv[2]]);
+      if (Number.isFinite(t)) process.stdout.write(String(Math.round((Date.now() - t) / 1000)));
+    } catch {}
+  ' "$STATUS_FILE" "$1"
+}
+
+# Leave the reason for every automatic restart in bridge.log (UTC, like the bridge).
+log_restart() {
+  printf '%s WARN control: ensure restarting bridge: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" "$1" >>"$LOG_FILE"
+  echo "$1; restarting"
+}
+
+restart_for() {
+  log_restart "$1"
+  stop
+  start
+  wait_connected
 }
 
 is_terminal_state() {
@@ -210,10 +242,42 @@ ensure() {
   fi
   age=$(heartbeat_age)
   if [ "$age" -gt "$HEARTBEAT_STALE_SECONDS" ]; then
-    echo "WhatsApp bridge heartbeat is ${age}s old; restarting"
-    stop
-    start
-    wait_connected
+    # The box may have just resumed from a pause (this routine run woke it): the
+    # bridge notices within ~5s and rewrites its heartbeat. Give it a grace period.
+    waited=0
+    while [ "$waited" -lt "$HEARTBEAT_GRACE_SECONDS" ] && is_running; do
+      sleep 5
+      waited=$((waited + 5))
+      age=$(heartbeat_age)
+      [ "$age" -le 30 ] && break
+    done
+  fi
+  if [ "$age" -gt "$HEARTBEAT_STALE_SECONDS" ]; then
+    restart_for "heartbeat is ${age}s old (event loop or status writes stuck)"
+    return $?
+  fi
+  if [ "$(status_field state)" = "connected" ]; then
+    frame_age=$(field_age lastFrameAt)
+    pause_age=$(field_age lastPauseAt)
+    # Just resumed from a box pause: the bridge is reconnecting on its own.
+    if [ -n "$frame_age" ] && [ "$frame_age" -gt "$FRAME_STALE_SECONDS" ] && { [ -z "$pause_age" ] || [ "$pause_age" -gt 120 ]; }; then
+      waited=0
+      while [ "$waited" -lt "$HEARTBEAT_GRACE_SECONDS" ] && is_running; do
+        sleep 5
+        waited=$((waited + 5))
+        frame_age=$(field_age lastFrameAt)
+        [ -n "$frame_age" ] && [ "$frame_age" -le "$FRAME_STALE_SECONDS" ] && break
+      done
+    fi
+    if [ -n "$frame_age" ] && [ "$frame_age" -gt "$FRAME_STALE_SECONDS" ] && { [ -z "$pause_age" ] || [ "$pause_age" -gt 120 ]; }; then
+      restart_for "connected but no WhatsApp frame for ${frame_age}s (dead socket)"
+      return $?
+    fi
+  fi
+  stuck_ms=$(status_field oldestInboundMs)
+  case "$stuck_ms" in (*[!0-9]*|'') stuck_ms=0 ;; esac
+  if [ "$stuck_ms" -gt $((INBOUND_STUCK_SECONDS * 1000)) ]; then
+    restart_for "an inbound message has been in flight for $((stuck_ms / 1000))s (pipeline wedged)"
     return $?
   fi
   case "$(status_field state)" in
@@ -224,7 +288,7 @@ ensure() {
 
 status() {
   if is_running; then
-    echo "WhatsApp bridge is running (state: $(status_field state), account: $(status_field account), groups visible: $(status_field groupsVisible), missing: $(status_field groupsMissing))"
+    echo "WhatsApp bridge is running (state: $(status_field state), heartbeat: $(heartbeat_age)s ago, last frame: $(field_age lastFrameAt)s ago, last upsert: $(field_age lastUpsertAt)s ago, oldest inbound in flight: $(status_field oldestInboundMs)ms, max loop lag: $(status_field eventLoopMaxLagMs)ms, account: $(status_field account), groups visible: $(status_field groupsVisible), missing: $(status_field groupsMissing))"
   else
     echo "WhatsApp bridge is not running (last state: $(status_field state))"
     exit 1

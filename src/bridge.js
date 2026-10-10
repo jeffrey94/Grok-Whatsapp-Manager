@@ -132,6 +132,12 @@ export class WhatsAppBridge {
       smartSplit: { maxParts: 3, minChars: 320, targetChars: 280 },
       quoteInDms: false,
       replyTimeoutMs: 10 * 60_000,
+      // How long one turn may hold its agent's queue after the prompt was sent.
+      // After that the reply keeps streaming in the background (same delivery
+      // locks, so nothing is sent twice) and the next message is handled. 0 = never release.
+      turnQueueHoldMs: 120_000,
+      // Max wait for a rate-limit slot before an agent reply part is dropped.
+      rateWaitMaxMs: 75_000,
       // Agent messages that arrive after their prompt's turn (a background task
       // finishing, or after a reply timeout) still go to the chat the agent last
       // served, for this long after that chat's prompt. 0 disables it.
@@ -150,6 +156,34 @@ export class WhatsAppBridge {
     // clientNonce -> sender access ("full" | "account" | "faq-only") for groups with a member list.
     this.turnAccess = new Map();
     this.lastScheduledCheck = new Map();
+    // msgId -> accepted-at: inbound messages accepted but not yet finished (watchdog).
+    this.inflight = new Map();
+  }
+
+  /** Age of the oldest accepted inbound message still being handled (0 when idle). */
+  oldestInflightMs() {
+    let oldest = Infinity;
+    for (const at of this.inflight.values()) oldest = Math.min(oldest, at);
+    return Number.isFinite(oldest) ? Math.max(0, this.options.now() - oldest) : 0;
+  }
+
+  /**
+   * Let a live turn hold the agent queue for at most turnQueueHoldMs. The turn
+   * itself keeps running; its errors are logged/notified when they happen.
+   */
+  async holdQueue(turnPromise, { chatId, msgId, onLateError } = {}) {
+    const holdMs = this.options.turnQueueHoldMs;
+    if (!(holdMs > 0)) return turnPromise;
+    let timer;
+    const released = Symbol("released");
+    const result = await Promise.race([
+      turnPromise,
+      new Promise((resolve) => { timer = setTimeout(() => resolve(released), holdMs); timer.unref?.(); }),
+    ]).finally(() => clearTimeout(timer));
+    if (result !== released) return result;
+    this.log.warn(`Turn still running after ${holdMs}ms chat=${chatId} msg=${msgId}; releasing the queue, reply continues in background`);
+    turnPromise.catch((error) => onLateError?.(error));
+    return { released: true };
   }
 
   rememberTurnAccess(clientNonce, access) {
@@ -196,7 +230,11 @@ export class WhatsAppBridge {
       return Promise.resolve({ dropped: verdict.reason });
     }
     this.log.info(`Inbound accepted chat=${event.chatId} msg=${event.id} kind=${event.kind} route=${verdict.route.kind}`);
-    return this.dispatcher.dispatch(event, options);
+    const key = `${event.chatId}|${event.id}`;
+    this.inflight.set(key, this.options.now());
+    const task = this.dispatcher.dispatch(event, options);
+    void Promise.resolve(task).finally(() => this.inflight.delete(key)).catch(() => {});
+    return task;
   }
 
   /** Per-message checks before bundling: own/bot/echo, allowlist, staleness, unsupported kinds. */
@@ -397,11 +435,20 @@ export class WhatsAppBridge {
         ...(route.dmId ? { dmId: route.dmId } : {}),
       });
       this.log.info(`Prompt sent chat=${chatId} msg=${primary.id} agent=${agent.id} attachments=${attachmentPaths.length}`);
-      await this.completeTurn(agent, clientNonce, { chatId, quoted, signal: options.signal });
-      return { handled: "prompt", clientNonce, agentId: agent.id };
+      const held = await this.holdQueue(this.completeTurn(agent, clientNonce, { chatId, quoted, signal: options.signal }), {
+        chatId,
+        msgId: primary.id,
+        onLateError: (error) => {
+          if (options.signal?.aborted || error?.name === "AbortError") return;
+          this.log.error(`Background turn failed chat=${chatId} msg=${primary.id}: ${error?.message ?? error}`);
+          void this.handleError(input, error, options).catch(() => {});
+        },
+      });
+      return { handled: "prompt", clientNonce, agentId: agent.id, ...(held?.released ? { released: true } : {}) };
     } finally {
       this.endTurn(agent.id);
-      if (showTyping) await this.transport.setTyping?.(chatId, false)?.catch?.(() => {});
+      // Never let a stuck presence update hold the agent queue.
+      if (showTyping) void Promise.resolve(this.transport.setTyping?.(chatId, false)).catch(() => {});
     }
   }
 
@@ -532,7 +579,16 @@ export class WhatsAppBridge {
           await this.transport.setTyping?.(chatId, true)?.catch?.(() => {});
           await sleep(Math.min(3_000, Math.max(this.options.sendDelayMs, part.text.length * 8)));
         } else if (turn.sentParts > 0 && this.options.sendDelayMs > 0) await sleep(this.options.sendDelayMs);
-        const gate = this.guard.takeOutbound(chatId, { windowMs: this.replyWindowMs() });
+        let gate = this.guard.takeOutbound(chatId, { windowMs: this.replyWindowMs() });
+        // A genuine agent reply that only hit the per-minute rate waits for a free
+        // slot (bounded) instead of being dropped for good.
+        for (let waited = 0; !gate.ok && /^outbound-(?:chat|global)-rate$/.test(gate.reason) && waited < this.options.rateWaitMaxMs;) {
+          const pause = Math.min(Math.max(250, this.guard.outboundWaitMs?.(chatId) ?? 1_000), this.options.rateWaitMaxMs - waited);
+          if (waited === 0) this.log.info(`Outbound rate-limited chat=${chatId} entry=${entry.id}; waiting up to ${Math.round(this.options.rateWaitMaxMs / 1000)}s for a slot`);
+          await sleep(pause);
+          waited += pause;
+          gate = this.guard.takeOutbound(chatId, { windowMs: this.replyWindowMs() });
+        }
         if (!gate.ok) {
           this.log.warn(`Outbound dropped chat=${chatId} reason=${gate.reason} remainingParts=${parts.length - index}`);
           progress.dropped = gate.reason;
@@ -541,7 +597,12 @@ export class WhatsAppBridge {
         }
         const sendOptions = !turn.quoteUsed && quoted ? { quoted } : {};
         if (part.type === "text") {
-          await this.transport.sendText(chatId, part.text, sendOptions);
+          try {
+            await this.transport.sendText(chatId, part.text, sendOptions);
+          } catch (error) {
+            this.guard.refundOutbound?.(chatId); // nothing was sent: don't burn rate budget on retries
+            throw error;
+          }
           if (pace) await this.transport.setTyping?.(chatId, false)?.catch?.(() => {});
           this.guard.recordOutboundText(chatId, part.text);
         } else {
